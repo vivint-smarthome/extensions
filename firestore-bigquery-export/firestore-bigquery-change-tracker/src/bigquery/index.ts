@@ -84,8 +84,8 @@ export class FirestoreBigQueryEventHistoryTracker
         },
       };
     });
-    await this.insertData(rows);
-    await this.upsertData(rows);
+
+    await Promise.all(this.insertData(rows), this.insertData(rows));
   }
 
   serializeData(eventData: any) {
@@ -206,9 +206,12 @@ export class FirestoreBigQueryEventHistoryTracker
       const dataset = this.bigqueryDataset();
       const table = dataset.table(this.rawSnapshotTableName());
       logs.dataUpserting(rows.length);
+      let promises = []
       for let(row of rows) {
-        await table.query("DELETE FROM `${this.rawSnapshotTableName()}` WHERE document_name = ?", row.document_name)
+        promises.push(table.query("DELETE FROM `${this.rawSnapshotTableName()}` WHERE document_name = ?", row.document_name))
       }
+      // await the deletes before proceeding with the inserts to ensure deletes are successful
+      await Promise.all(promises);
       await this.insertData(rows, overrideOptions, true)
       logs.dataUpserted(rows.length)
     } catch (e) {
