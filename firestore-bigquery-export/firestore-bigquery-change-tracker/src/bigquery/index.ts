@@ -20,6 +20,7 @@ import * as traverse from "traverse";
 import {
   RawChangelogSchema,
   RawChangelogViewSchema,
+  RawSnapshotSchema,
   documentIdField,
 } from "./schema";
 import { latestConsistentSnapshotView } from "./snapshot";
@@ -35,7 +36,7 @@ import {
   TableMetadata,
 } from "@google-cloud/bigquery/build/src/table";
 
-export { RawChangelogSchema, RawChangelogViewSchema } from "./schema";
+export { RawChangelogSchema, RawChangelogViewSchema, RawSnapshotSchema } from "./schema";
 
 export interface FirestoreBigQueryEventHistoryTrackerConfig {
   datasetId: string;
@@ -50,6 +51,7 @@ export interface FirestoreBigQueryEventHistoryTrackerConfig {
  * When the first event is received, it creates necessary BigQuery resources:
  * - Dataset: {@link FirestoreBigQueryEventHistoryTrackerConfig#datasetId}.
  * - Table: Raw change log table {@link FirestoreBigQueryEventHistoryTracker#rawChangeLogTableName}.
+ * - Table: Raw snapshot table {@link FirestoreBigQueryEventHistoryTracker#rawSnapshotTableName}.
  * - View: Latest view {@link FirestoreBigQueryEventHistoryTracker#rawLatestView}.
  * If any subsequent data export fails, it will attempt to reinitialize.
  */
@@ -83,6 +85,7 @@ export class FirestoreBigQueryEventHistoryTracker
       };
     });
     await this.insertData(rows);
+    await this.upsertData(rows);
   }
 
   serializeData(eventData: any) {
@@ -185,6 +188,45 @@ export class FirestoreBigQueryEventHistoryTracker
   }
 
   /**
+   * Upserts rows of data into the BigQuery snapshot table.
+   */
+  private async upsertData(
+    rows: bigquery.RowMetadata[],
+    overrideOptions: InsertRowsOptions = {},
+    delete: boolean = true
+    retry: boolean = true
+  ) {
+    const options = {
+      skipInvalidRows: false,
+      ignoreUnknownValues: false,
+      raw: true,
+      ...overrideOptions
+    };
+    try {
+      const dataset = this.bigqueryDataset();
+      const table = dataset.table(this.rawSnapshotTableName());
+      logs.dataUpserting(rows.length);
+      for let(row of rows) {
+        await table.query("DELETE FROM `${this.rawSnapshotTableName()}` WHERE document_name = ?", row.document_name)
+      }
+      await this.insertData(rows, overrideOptions, true)
+      logs.dataUpserted(rows.length)
+    } catch (e) {
+      if (retry && this.isRetryableInsertionError(e)) {
+        retry = false;
+        logs.dataUpsertRetried(rows.length);
+        return this.upsertData(
+          rows,
+          { ...overrideOptions, ignoreUnknownValues: true },
+          retry
+        );
+      }
+      this.initialized = false;
+      throw e;
+    }
+  }
+
+  /**
    * Creates the BigQuery resources with the expected schema for {@link FirestoreEventHistoryTracker}.
    * After the first invokation, it skips initialization assuming these resources are still there.
    */
@@ -259,6 +301,50 @@ export class FirestoreBigQueryEventHistoryTracker
   }
 
   /**
+   * Creates the raw change log table if it doesn't already exist.
+   * TODO: Validate that the BigQuery schema is correct if the table does exist,
+   */
+  private async initializeRawSnapshotTable() {
+    const snapshotName = this.rawSnapshotTableName();
+    const dataset = this.bigqueryDataset();
+    const table = dataset.table(snapshotName);
+    const [tableExists] = await table.exists();
+
+    if (tableExists) {
+      logs.bigQueryTableAlreadyExists(table.id, dataset.id);
+
+      const [metadata] = await table.getMetadata();
+      const fields = metadata.schema.fields;
+
+      const documentIdColExists = fields.find(
+        (column) => column.name === "document_id"
+      );
+
+      if (!documentIdColExists) {
+        fields.push(documentIdField);
+        await table.setMetadata(metadata);
+        logs.addDocumentIdColumn(this.rawSnapshotTableName());
+      }
+    } else {
+      logs.bigQueryTableCreating(snapshotName);
+      const options: TableMetadata = {
+        friendlyName: snapshotName,
+        schema: RawSnapshotSchema,
+      };
+
+      if (this.config.tablePartitioning) {
+        options.timePartitioning = {
+          type: this.config.tablePartitioning,
+        };
+      }
+
+      await table.create(options);
+      logs.bigQueryTableCreated(snapshotName);
+    }
+    return table;
+  }
+
+  /**
    * Creates the latest snapshot view, which returns only latest operations
    * of all existing documents over the raw change log table.
    */
@@ -316,6 +402,10 @@ export class FirestoreBigQueryEventHistoryTracker
 
   private rawChangeLogTableName(): string {
     return `${this.config.tableId}_raw_changelog`;
+  }
+
+  private rawSnapshotTableName(): string {
+    return `${this.config.tableId}_raw_snapshot`;
   }
 
   private rawLatestView(): string {

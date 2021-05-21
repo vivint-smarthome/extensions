@@ -155,6 +155,20 @@ export const dataTypeInvalid = (
   );
 };
 
+export const dataUpserting = (rowCount: number) => {
+  logger.log(`Upserting ${rowCount} row(s) of data into BigQuery`)
+}
+
+export const dataUpserted = (rowCount: number) => {
+  logger.log(`Upserted ${rowCount} row(s) of data into BigQuery`)
+}
+
+export const dataUpsertRetried = (rowCount: number) => {
+  logger.log(
+    `Retried to upsert ${rowCount} row(s) of data into BigQuery (ignoring unknown columns)`
+  );
+};
+
 export const error = (err: Error) => {
   logger.error("Error when mirroring data to BigQuery", err);
 };
